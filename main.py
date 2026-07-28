@@ -135,7 +135,7 @@ def _resolve_config(req: GenerateRequest):
             status_code=400,
             detail="API key is required — set LLM_API_KEY in backend .env",
         )
-    llm_base_url = req.llm_base_url or os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")
+    llm_base_url = req.llm_base_url or os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
     model = req.model or os.getenv("LLM_MODEL", "gpt-4o-mini")
     return api_key, llm_base_url, model
 
