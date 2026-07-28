@@ -1,0 +1,11 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+
+# Data
+*.dat
+
+# IDE
+.idea/
+.vscode/
