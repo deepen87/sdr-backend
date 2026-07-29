@@ -53,6 +53,9 @@ class GenerateRequest(BaseModel):
     llm_base_url: str = ""
     model: str = ""
 
+class EnrichRequest(BaseModel):
+    url: str
+
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 def _derive_key(pin: str, salt: bytes) -> bytes:
@@ -124,6 +127,101 @@ def get_key(req: KeyRequest):
     return {"api_key": decrypted.decode()}
 
 
+# ── Enrichment ──────────────────────────────────────────────────────────
+
+import re as _re
+
+
+def _strip_html(html: str) -> str:
+    """Remove HTML tags and collapse whitespace."""
+    text = _re.sub(r"<[^>]+>", " ", html)
+    text = _re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+async def _fetch_and_extract(url: str) -> str:
+    """Fetch a URL, strip HTML, return the first ~4000 chars of readable text."""
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(15.0, connect=10.0),
+        follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; SDR-App/1.0)"},
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    text = _strip_html(resp.text)
+    # Clamp to a reasonable chunk for the LLM
+    return text[:4000]
+
+
+ENRICH_SYSTEM_PROMPT = """\
+You are an expert sales researcher. Given raw text scraped from a URL (LinkedIn profile or company website), extract structured prospect data.
+
+Return ONLY valid JSON with these keys:
+- prospect_first_name: the person's first name (or "")
+- prospect_last_name: the person's last name (or "")
+- prospect_title: their job title (or "")
+- company_name: their company (or "")
+- prospect_bio: a 1-2 sentence bio summarizing their background (or "")
+- recent_linkedin_activity: any recent posts, comments, or activity mentioned — write a short excerpt (or "")
+- company_news: recent news about the company — funding, hiring, products (or "")
+- inferred_value_prop: what the company seems to do/sell — 1 sentence (or "")
+
+If this is a company page with no specific person, set person fields to "" and fill company_name, company_news, and inferred_value_prop.
+Use the URL context to determine what's most relevant. Be concise — max 2 sentences per field.
+"""
+
+
+@app.post("/api/enrich")
+async def enrich(req: EnrichRequest):
+    """Fetch a URL and extract structured prospect data via the LLM."""
+    try:
+        page_text = await _fetch_and_extract(req.url)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: HTTP {e.response.status_code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
+
+    api_key = os.getenv("LLM_API_KEY", "")
+    llm_base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    model = os.getenv("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="LLM_API_KEY not configured on backend")
+
+    prompt = f"""\
+URL: {req.url}
+
+PAGE CONTENT:
+{page_text}
+
+Extract all prospect information from the page content above and return ONLY valid JSON."""
+
+    content = await _call_llm(prompt, api_key, llm_base_url, model, max_tokens=600)
+    # Parse the LLM output — it should be JSON
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.split("\n")
+        lines.pop(0)
+        if lines and lines[-1].strip() == "```":
+            lines.pop()
+        cleaned = "\n".join(lines).strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # LLM didn't return valid JSON; return as raw text
+        return {
+            "prospect_first_name": "",
+            "prospect_last_name": "",
+            "prospect_title": "",
+            "company_name": "",
+            "prospect_bio": "",
+            "recent_linkedin_activity": "",
+            "company_news": "",
+            "inferred_value_prop": "",
+            "_raw": cleaned,
+        }
+
+
 # ── LLM helpers ─────────────────────────────────────────────────────────
 
 
@@ -136,7 +234,7 @@ def _resolve_config(req: GenerateRequest):
             detail="API key is required — set LLM_API_KEY in backend .env",
         )
     llm_base_url = req.llm_base_url or os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    model = req.model or os.getenv("LLM_MODEL", "gpt-4o-mini")
+    model = req.model or os.getenv("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
     return api_key, llm_base_url, model
 
 
