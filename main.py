@@ -133,8 +133,14 @@ import re as _re
 
 
 def _strip_html(html: str) -> str:
-    """Remove HTML tags and collapse whitespace."""
-    text = _re.sub(r"<[^>]+>", " ", html)
+    """Remove HTML tags and collapse whitespace.
+    Also strips <script>, <style>, <svg> tag contents so embedded JSON-LD/CSS doesn't leak.
+    """
+    # Remove script, style, svg blocks and their contents
+    text = _re.sub(r"<(?:script|style|svg)[^>]*>.*?</(?:script|style|svg)>", " ", html, flags=_re.DOTALL)
+    # Remove remaining HTML tags
+    text = _re.sub(r"<[^>]+>", " ", text)
+    # Collapse whitespace
     text = _re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -151,24 +157,6 @@ async def _fetch_and_extract(url: str) -> str:
     text = _strip_html(resp.text)
     # Clamp to a reasonable chunk for the LLM
     return text[:4000]
-
-
-ENRICH_SYSTEM_PROMPT = """\
-You are an expert sales researcher. Given raw text scraped from a URL (LinkedIn profile or company website), extract structured prospect data.
-
-Return ONLY valid JSON with these keys:
-- prospect_first_name: the person's first name (or "")
-- prospect_last_name: the person's last name (or "")
-- prospect_title: their job title (or "")
-- company_name: their company (or "")
-- prospect_bio: a 1-2 sentence bio summarizing their background (or "")
-- recent_linkedin_activity: any recent posts, comments, or activity mentioned — write a short excerpt (or "")
-- company_news: recent news about the company — funding, hiring, products (or "")
-- inferred_value_prop: what the company seems to do/sell — 1 sentence (or "")
-
-If this is a company page with no specific person, set person fields to "" and fill company_name, company_news, and inferred_value_prop.
-Use the URL context to determine what's most relevant. Be concise — max 2 sentences per field.
-"""
 
 
 @app.post("/api/enrich")
@@ -193,7 +181,20 @@ URL: {req.url}
 PAGE CONTENT:
 {page_text}
 
-Extract all prospect information from the page content above and return ONLY valid JSON."""
+Extract prospect/sales information from the page content above.
+
+Return ONLY valid JSON with exactly these keys (all strings, use "" if unknown):
+- prospect_first_name: the person's first name
+- prospect_last_name: the person's last name
+- prospect_title: their job title
+- company_name: their company
+- prospect_bio: 1-2 sentence bio
+- recent_linkedin_activity: any recent posts/activity mentioned
+- company_news: recent company news (funding, hiring, products)
+- inferred_value_prop: what the company does/sells (1 sentence)
+
+If this is a company page with no specific person, set person fields to "" and fill company_name, company_news, inferred_value_prop.
+Do NOT copy any existing JSON or structured data from the page — synthesize your own from the text."""
 
     content = await _call_llm(prompt, api_key, llm_base_url, model, max_tokens=600)
     # Parse the LLM output — it should be JSON
