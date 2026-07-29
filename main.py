@@ -196,7 +196,7 @@ Return ONLY valid JSON with exactly these keys (all strings, use "" if unknown):
 If this is a company page with no specific person, set person fields to "" and fill company_name, company_news, inferred_value_prop.
 Do NOT copy any existing JSON or structured data from the page — synthesize your own from the text."""
 
-    content = await _call_llm(prompt, api_key, llm_base_url, model, max_tokens=600)
+    content = await _call_llm(prompt, api_key, llm_base_url, model, max_tokens=600, retries=2)
     # Parse the LLM output — it should be JSON
     cleaned = content.strip()
     if cleaned.startswith("```"):
