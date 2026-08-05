@@ -6,15 +6,18 @@ at startup by presenting the PIN, then calls the LLM directly from the device.
 """
 
 import asyncio
+import collections
+import ipaddress
 import os
 import json
+import threading
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import bcrypt
 from cryptography.fernet import Fernet
 import httpx
 from cryptography.hazmat.primitives import hashes
@@ -25,11 +28,13 @@ load_dotenv()
 
 app = FastAPI(title="SDR Key Vault")
 
-# Allow Flutter web (and any local dev origin) to call the API
+# Allow the Flutter app to call the API.
+# allow_credentials=True + "*" is not allowed by CORS, and this API is
+# token- (not cookie-) based, so credentials aren't needed here.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # local-only, safe
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -38,6 +43,85 @@ app.add_middleware(
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
 DATA_FILE = Path(os.getenv("DATA_FILE", "key_store.dat"))
+
+# Client gate: the Flutter app must send this header or requests are rejected.
+# Set in backend .env (and on SnapDeploy). Empty string disables the check
+# for local convenience — leave disabled only on a local-only backend.
+CLIENT_SECRET = os.getenv("SDR_CLIENT_SECRET", "").strip()
+
+# Rate limiting / PIN brute-force protection.
+# A small fixed window is used so a rotating IP can't brute-force the PIN.
+LOGIN_WINDOW_SEC = float(os.getenv("LOGIN_WINDOW_SEC", "60"))
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
+PIN_LOCKOUT_SEC = int(os.getenv("PIN_LOCKOUT_SEC", "300"))  # 5 min after too many failures
+RATE_LIMIT_WINDOW_SEC = float(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
+RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "20"))
+
+# In-memory tracking (per-process; fine for a single container).
+_login_attempts: dict[str, list[float]] = {}   # ip -> timestamps of key/setup calls
+_invalid_pin: dict[str, tuple[list[float], float]] = {}  # ip -> (failure times, lockout_until)
+_api_hits: dict[str, collections.deque] = {}   # ip -> sliding window of timestamps
+_rate_lock = threading.Lock()
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP (handles common configured proxy headers)."""
+    for header in ("x-forwarded-for", "x-real-ip"):
+        val = request.headers.get(header)
+        if val:
+            return val.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _locked_out(ip: str, now: float) -> bool:
+    with _rate_lock:
+        entry = _invalid_pin.get(ip)
+        if not entry:
+            return False
+        failures, until = entry
+        if now < until:
+            return True
+        # Lockout expired — clear it.
+        del _invalid_pin[ip]
+        return False
+
+
+def _enforce_login_limit(ip: str, now: float):
+    """Rate-limit /api/setup and /api/key per IP."""
+    with _rate_lock:
+        times = _login_attempts.setdefault(ip, [])
+        times[:] = [t for t in times if now - t < LOGIN_WINDOW_SEC]
+        if len(times) >= LOGIN_MAX_ATTEMPTS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many attempts. Try again later.",
+            )
+        times.append(now)
+
+
+def _record_failed_pin(ip: str, now: float):
+    """Track consecutive PIN failures; lock the IP after too many."""
+    with _rate_lock:
+        failures, _until = _invalid_pin.get(ip, ([], 0.0))
+        failures[:] = [t for t in failures if now - t < PIN_LOCKOUT_SEC]
+        failures.append(now)
+        # Lock if 5 failures within the window.
+        if len(failures) >= 5:
+            _invalid_pin[ip] = (failures, now + PIN_LOCKOUT_SEC)
+
+
+def _enforce_rate_limit(ip: str, now: float):
+    """Generic sliding-window limiter for the LLM-priced endpoints."""
+    with _rate_lock:
+        dq = _api_hits.setdefault(ip, collections.deque())
+        while dq and now - dq[0] > RATE_LIMIT_WINDOW_SEC:
+            dq.popleft()
+        if len(dq) >= RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Try again later.",
+            )
+        dq.append(now)
 
 # ── Schemas ─────────────────────────────────────────────────────────────
 class SetupRequest(BaseModel):
@@ -96,7 +180,11 @@ def health():
 
 
 @app.post("/api/setup")
-def setup(req: SetupRequest):
+def setup(req: SetupRequest, request: Request):
+    ip = _client_ip(request)
+    _enforce_login_limit(ip, time.time())
+    if _locked_out(ip, time.time()):
+        raise HTTPException(status_code=429, detail="Too many failures. Locked out.")
     if len(req.pin) < 4:
         raise HTTPException(status_code=400, detail="PIN must be at least 4 characters")
     if not req.api_key.strip():
@@ -112,7 +200,11 @@ def setup(req: SetupRequest):
 
 
 @app.post("/api/key")
-def get_key(req: KeyRequest):
+def get_key(req: KeyRequest, request: Request):
+    ip = _client_ip(request)
+    _enforce_login_limit(ip, time.time())
+    if _locked_out(ip, time.time()):
+        raise HTTPException(status_code=429, detail="Too many failures. Locked out.")
     store = _load_store()
     if store is None:
         raise HTTPException(status_code=404, detail="No key stored. Call /api/setup first.")
@@ -122,9 +214,78 @@ def get_key(req: KeyRequest):
     try:
         decrypted = fernet.decrypt(store["raw_encrypted"])
     except Exception:
+        _record_failed_pin(ip, time.time())
         raise HTTPException(status_code=403, detail="Invalid PIN")
 
     return {"api_key": decrypted.decode()}
+
+
+# ── Security guards ─────────────────────────────────────────────────────
+
+
+def _require_client_secret(request: Request):
+    """Reject requests that don't carry the shared client secret header.
+
+    Only enforces when a secret is configured (local dev without one is allowed).
+    """
+    if CLIENT_SECRET and request.headers.get("X-SDR-Client-Secret", "") != CLIENT_SECRET:
+        raise HTTPException(status_code=401, detail="Missing or invalid client secret")
+
+
+def _is_ssrf_blocked(url: str) -> bool:
+    """Block SSRF: non-http(s) schemes, and any host resolving to a non-public address.
+
+    Looks at the literal host and (for hostnames) resolves via the system resolver,
+    so a name like 'localhost', 'metadata.google.internal', or '0.0.0.0' is caught
+    even if it isn't a raw IP. 172.16/12, 10/8, 192.168/16, loopback, link-local,
+    CGNAT, and metadata subnets are all treated as internal.
+    """
+    try:
+        parsed = httpx.URL(url)
+    except Exception:
+        return True
+    if parsed.scheme not in ("http", "https"):
+        return True
+    host = parsed.host or ""
+    if not host:
+        return True
+
+    def _blocked(ip_str: str) -> bool:
+        ip = ipaddress.ip_address(ip_str)
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+            or (ip.version == 6 and ip.is_site_local)
+            or (ip.version == 6 and ip.ipv4_mapped is not None and _blocked(str(ip.ipv4_mapped)))
+        )
+
+    # Literal IP host — check directly.
+    try:
+        if _blocked(host):
+            return True
+        return False
+    except ValueError:
+        pass
+
+    # Hostname — resolve every A/AAAA record and block if any is internal.
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except Exception:
+        return True  # failed resolution → treat as blocked
+    for info in infos:
+        addr = info[4][0]
+        try:
+            if _blocked(addr):
+                return True
+        except ValueError:
+            return True
+    return False
 
 
 # ── Enrichment ──────────────────────────────────────────────────────────
@@ -145,35 +306,46 @@ def _strip_html(html: str) -> str:
     return text.strip()
 
 
+# Max bytes we're willing to download from an arbitrary URL before clipping.
+_MAX_DOWNLOAD_BYTES = 512 * 1024  # 512 KB
+
+
 async def _fetch_and_extract(url: str) -> str:
     """Fetch a URL, strip HTML, return the first ~4000 chars of readable text."""
+    if _is_ssrf_blocked(url):
+        raise HTTPException(status_code=400, detail="URL must be a public http(s) address")
     async with httpx.AsyncClient(
         timeout=httpx.Timeout(15.0, connect=10.0),
         follow_redirects=True,
         headers={"User-Agent": "Mozilla/5.0 (compatible; SDR-App/1.0)"},
     ) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-    text = _strip_html(resp.text)
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            raw = b""
+            async for chunk in resp.aiter_bytes():
+                raw += chunk
+                if len(raw) > _MAX_DOWNLOAD_BYTES:
+                    break
+    text = _strip_html(raw.decode("utf-8", errors="ignore"))
     # Clamp to a reasonable chunk for the LLM
     return text[:4000]
 
 
 @app.post("/api/enrich")
-async def enrich(req: EnrichRequest):
+async def enrich(req: EnrichRequest, request: Request):
     """Fetch a URL and extract structured prospect data via the LLM."""
+    _require_client_secret(request)
+    _enforce_rate_limit(_client_ip(request), time.time())
     try:
         page_text = await _fetch_and_extract(req.url)
+    except HTTPException as e:
+        raise  # pass through SSRF block (400) as-is
     except httpx.HTTPStatusError as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch URL: HTTP {e.response.status_code}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch URL: {e}")
 
-    api_key = os.getenv("LLM_API_KEY", "")
-    llm_base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    model = os.getenv("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
-    if not api_key:
-        raise HTTPException(status_code=400, detail="LLM_API_KEY not configured on backend")
+    api_key, llm_base_url, model = _resolve_config(req)
 
     prompt = f"""\
 URL: {req.url}
@@ -232,15 +404,19 @@ Do NOT copy any existing JSON or structured data from the page — synthesize yo
 
 
 def _resolve_config(req: GenerateRequest):
-    """Resolve API key, base URL, and model from request or env."""
-    api_key = req.api_key or os.getenv("LLM_API_KEY", "")
+    """Resolve API key, base URL, and model from env ONLY.
+
+    Caller-supplied values (api_key / llm_base_url / model) are intentionally
+    ignored so the backend can't be pointed at an attacker-controlled endpoint.
+    """
+    api_key = os.getenv("LLM_API_KEY", "")
     if not api_key.strip():
         raise HTTPException(
             status_code=400,
             detail="API key is required — set LLM_API_KEY in backend .env",
         )
-    llm_base_url = req.llm_base_url or os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-    model = req.model or os.getenv("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
+    llm_base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+    model = os.getenv("LLM_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free")
     return api_key, llm_base_url, model
 
 
@@ -265,7 +441,7 @@ async def _call_llm(prompt: str, api_key: str, llm_base_url: str, model: str, ma
             await asyncio.sleep(wait)
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(65.0, connect=10.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
                 resp = await client.post(url, headers=headers, json=body)
 
             if resp.status_code in (429, 502, 503, 504) and attempt < retries:
@@ -335,15 +511,17 @@ def _parse_email_response(content: str) -> dict:
 # ── Endpoints ──────────────────────────────────────────────────────────
 
 @app.post("/api/generate")
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, request: Request):
     """Proxy an LLM call server-to-server (avoids browser CORS blocks)."""
+    _require_client_secret(request)
+    _enforce_rate_limit(_client_ip(request), time.time())
     api_key, llm_base_url, model = _resolve_config(req)
     content = await _call_llm(req.prompt, api_key, llm_base_url, model)
     return _parse_email_response(content)
 
 
 @app.post("/api/generate-sequence")
-async def generate_sequence(req: GenerateRequest):
+async def generate_sequence(req: GenerateRequest, request: Request):
     """Generate a 3-email follow-up sequence from one prompt.
 
     Makes 3 sequential LLM calls:
@@ -351,6 +529,8 @@ async def generate_sequence(req: GenerateRequest):
       2. Follow-up — brief follow-up referencing the first
       3. Break-up — final short email
     """
+    _require_client_secret(request)
+    _enforce_rate_limit(_client_ip(request), time.time())
     api_key, llm_base_url, model = _resolve_config(req)
     base_prompt = req.prompt
 
